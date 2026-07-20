@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 
 class TransactionType(str, Enum):
@@ -34,12 +34,28 @@ class ConflictError(AppError):
     """상태 충돌(예: 사용 중인 카테고리 삭제 시도) 시 발생하는 예외."""
 
 
+class SummaryResult(TypedDict):
+    """BudgetService.summary()가 돌려주는 dict의 계약(스키마)을 명시한다."""
+
+    has_data: bool
+    total_income: int
+    total_expense: int
+    balance: int
+    top_categories: List[Tuple[str, int]]
+    budget_amount: Optional[int]
+    usage_rate: Optional[float]
+    over_budget: bool
+
+
 @dataclass
 class Transaction:
-    """거래 내역 하나를 표현하는 데이터 모델.
+    """거래 내역 하나를 표현하는 순수 데이터 모델(dataclass).
 
     id, type, date, amount, category, memo, tags 필드를 가지며
-    입출력 계약을 명확히 하기 위해 dataclass + 타입 힌트로 정의한다.
+    입출력 계약을 명확히 하기 위해 타입 힌트로 정의한다.
+    책임 범위: 데이터를 담고 dict<->객체로 변환하는 것까지만 담당하며,
+    형식/범위 검증(날짜 형식, 금액 양수 등)은 이 클래스가 아니라
+    validators.py의 함수들이 담당한다(책임 분리).
     """
 
     id: str

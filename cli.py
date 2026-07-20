@@ -69,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     import_p = subparsers.add_parser("import", help="CSV 파일에서 거래 일괄 등록")
     import_p.add_argument("--from", dest="from_file", required=True, help="가져올 CSV 파일 경로")
+    import_p.add_argument(
+        "--strict",
+        action="store_true",
+        help="하나라도 검증 실패 행이 있으면 아무것도 저장하지 않고 전체 취소 (기본: 유효한 행만 부분 저장)",
+    )
 
     export_p = subparsers.add_parser("export", help="조건에 맞는 거래를 CSV로 내보내기")
     export_p.add_argument("--out", required=True, help="내보낼 CSV 파일 경로")
@@ -206,9 +211,11 @@ def cmd_delete(service: BudgetService, tx_id: str) -> None:
 @handle_errors
 @measure_time
 @log_call
-def cmd_import(service: BudgetService, from_file: str) -> None:
-    result = service.import_csv(from_file)
+def cmd_import(service: BudgetService, from_file: str, strict: bool) -> None:
+    result = service.import_csv(from_file, strict=strict)
     print(f"[완료] imported={result['imported']}, skipped={result['skipped']}")
+    for err in result["errors"]:
+        print(f"  [스킵] 행 {err['row']}: {err['reason']}")
 
 
 @handle_errors
@@ -265,7 +272,7 @@ def run(argv: Optional[list] = None) -> None:
     elif args.command == "delete":
         cmd_delete(service, args.id)
     elif args.command == "import":
-        cmd_import(service, args.from_file)
+        cmd_import(service, args.from_file, args.strict)
     elif args.command == "export":
         cmd_export(service, args.out, args.month, args.date_from, args.date_to)
     elif args.command == "backup":

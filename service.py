@@ -2,11 +2,19 @@
 from __future__ import annotations
 
 import csv
+import heapq
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .models import ConflictError, NotFoundError, Transaction, TransactionType, ValidationError
+from .models import (
+    ConflictError,
+    NotFoundError,
+    SummaryResult,
+    Transaction,
+    TransactionType,
+    ValidationError,
+)
 from .storage import BudgetStore, CategoryStore, TransactionRepository
 from .validators import validate_amount, validate_category, validate_date, validate_month, validate_type
 
@@ -41,8 +49,14 @@ class BudgetService:
         return tx
 
     def list_transactions(self, limit: int = 20) -> List[Transaction]:
-        all_tx = sorted(self.tx_repo.iter_all(), key=lambda t: (t.date, t.id), reverse=True)
-        return all_tx[:limit]
+        """최신순 상위 limit개만 반환한다.
+
+        전체를 리스트로 모아 정렬(sorted)하면 거래가 10만 건이어도 10만 건이
+        전부 메모리에 올라간다. heapq.nlargest는 내부적으로 크기 limit짜리
+        힙만 유지하므로, limit이 작을 때 메모리 사용량을 크게 줄인다.
+        (파일은 여전히 iter_all()로 한 줄씩 스트리밍해서 읽는다.)
+        """
+        return heapq.nlargest(limit, self.tx_repo.iter_all(), key=lambda t: (t.date, t.id))
 
     def search_transactions(
         self,
@@ -125,7 +139,7 @@ class BudgetService:
         self.budget_store.set(month, amount_val)
         return amount_val
 
-    def summary(self, month: str, top: int = 5) -> Dict[str, object]:
+    def summary(self, month: str, top: int = 5) -> SummaryResult:
         month = validate_month(month)
         tx_in_month = [tx for tx in self.tx_repo.iter_all() if tx.date.startswith(month)]
         total_income = sum(t.amount for t in tx_in_month if t.type == TransactionType.INCOME)
@@ -180,29 +194,72 @@ class BudgetService:
                 writer.writerow([tx.date, tx.type.value, tx.category, tx.amount, tx.memo, ",".join(tx.tags)])
         return len(rows)
 
-    def import_csv(self, in_path: str) -> Dict[str, int]:
+    def import_csv(self, in_path: str, strict: bool = False) -> Dict[str, object]:
+        """CSV에서 거래를 일괄 등록한다.
+
+        정책: 먼저 모든 행을 검증만 하고(파일에는 아직 쓰지 않음), 그 결과에 따라
+        - strict=False(기본): 유효한 행만 실제로 저장하고, 실패한 행은 행 번호와
+          이유를 함께 보고한다(부분 성공 허용).
+        - strict=True: 단 한 행이라도 검증에 실패하면 아무 것도 저장하지 않고
+          전체를 중단한다(all-or-nothing). 미리 검증부터 끝내고 그 다음에만
+          파일에 쓰기 때문에, 쓰다가 중간에 실패해서 일부만 반영되는 상황 자체가
+          생기지 않는다.
+        """
         path = Path(in_path)
         if not path.exists():
             raise ValidationError(f"파일을 찾을 수 없습니다: {in_path}", "경로를 다시 확인하세요.")
-        imported = 0
-        skipped = 0
+
+        valid_rows: List[Dict[str, object]] = []
+        errors: List[Dict[str, object]] = []
+        existing_categories = self.cat_store.list()
+
         with open(path, "r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
-            for row in reader:
+            for row_number, row in enumerate(reader, start=2):  # 1행은 헤더
                 try:
+                    date = validate_date(row.get("date", ""))
+                    type_ = validate_type(row.get("type", ""))
+                    category = validate_category(row.get("category", ""), existing_categories)
+                    amount = validate_amount(row.get("amount", ""))
                     tags = [t for t in (row.get("tags") or "").split(",") if t]
-                    self.add_transaction(
-                        date=row["date"],
-                        type_=row["type"],
-                        category=row["category"],
-                        amount=row["amount"],
-                        memo=row.get("memo", ""),
-                        tags=tags,
+                    valid_rows.append(
+                        {
+                            "date": date,
+                            "type": type_,
+                            "category": category,
+                            "amount": amount,
+                            "memo": row.get("memo", "") or "",
+                            "tags": tags,
+                        }
                     )
-                    imported += 1
-                except Exception:
-                    skipped += 1
-        return {"imported": imported, "skipped": skipped}
+                except ValidationError as exc:
+                    errors.append({"row": row_number, "reason": exc.cause})
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"row": row_number, "reason": str(exc)})
+
+        if strict and errors:
+            first = errors[0]
+            raise ValidationError(
+                f"{len(errors)}건의 행에서 오류가 발견되어 가져오기를 중단했습니다 (아무 것도 저장되지 않음).",
+                f"예: 행 {first['row']} - {first['reason']}",
+            )
+
+        imported = 0
+        for data in valid_rows:
+            tx_id = self.tx_repo.next_id()
+            tx = Transaction(
+                id=tx_id,
+                type=TransactionType(data["type"]),
+                date=data["date"],
+                amount=data["amount"],
+                category=data["category"],
+                memo=data["memo"],
+                tags=data["tags"],
+            )
+            self.tx_repo.append(tx)
+            imported += 1
+
+        return {"imported": imported, "skipped": len(errors), "errors": errors}
 
     # ---------- 백업 (보너스) ----------
     def backup(self, data_dir: Path) -> Path:

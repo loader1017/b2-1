@@ -37,7 +37,12 @@ def _atomic_write_lines(path: Path, lines: Iterable[str]) -> None:
 
 
 class TransactionRepository:
-    """거래 내역 파일 저장소 (transactions.jsonl)."""
+    """거래 내역 파일 저장소 (transactions.jsonl).
+
+    책임 범위: 파일을 읽고/쓰는 I/O만 담당한다. "이 category가 존재하는가",
+    "금액이 양수인가" 같은 업무 규칙 검증은 이 클래스가 알지 못하며,
+    그 판단은 상위 계층인 service.py(BudgetService)의 책임이다.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -45,6 +50,23 @@ class TransactionRepository:
         if not self.path.exists():
             self.path.touch()
             print(f"[안내] 거래 저장 파일을 새로 생성했습니다: {self.path}")
+        # id 발급용 카운터. transactions.jsonl과 나란히 둔 별도 파일에 마지막으로
+        # 발급한 번호만 저장해서, add 할 때마다 전체 파일을 스캔하지 않도록 한다.
+        # (거래 10만 건 환경에서 매 add마다 O(n) 스캔이 발생하는 것을 방지하는 최적화)
+        self.counter_path = self.path.with_suffix(self.path.suffix + ".counter")
+        if not self.counter_path.exists():
+            self._rebuild_counter()
+
+    def _rebuild_counter(self) -> None:
+        """카운터 파일이 없을 때(최초 실행 등) 기존 데이터를 한 번만 스캔해 복구한다."""
+        max_num = 0
+        for tx in self.iter_all():
+            try:
+                num = int(tx.id.split("-")[-1])
+                max_num = max(max_num, num)
+            except (ValueError, IndexError):
+                continue
+        self.counter_path.write_text(str(max_num), encoding="utf-8")
 
     def iter_all(self) -> Generator[Transaction, None, None]:
         """파일 전체를 메모리에 올리지 않고 한 줄씩 읽어 스트리밍한다."""
@@ -58,16 +80,18 @@ class TransactionRepository:
     def append(self, tx: Transaction) -> None:
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(tx.to_dict(), ensure_ascii=False) + "\n")
+        try:
+            num = int(tx.id.split("-")[-1])
+            current = int(self.counter_path.read_text(encoding="utf-8").strip() or "0")
+            if num > current:
+                self.counter_path.write_text(str(num), encoding="utf-8")
+        except (ValueError, IndexError):
+            pass
 
     def next_id(self) -> str:
-        max_num = 0
-        for tx in self.iter_all():
-            try:
-                num = int(tx.id.split("-")[-1])
-                max_num = max(max_num, num)
-            except (ValueError, IndexError):
-                continue
-        return f"TX-{max_num + 1:06d}"
+        """카운터 파일 1줄만 읽어 O(1)로 다음 id를 계산한다 (전체 스캔 없음)."""
+        current = int(self.counter_path.read_text(encoding="utf-8").strip() or "0")
+        return f"TX-{current + 1:06d}"
 
     def replace_all(self, transactions: Iterable[Transaction]) -> None:
         lines = (json.dumps(tx.to_dict(), ensure_ascii=False) for tx in transactions)
